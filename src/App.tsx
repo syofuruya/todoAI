@@ -1,8 +1,12 @@
 import { useEffect, useState } from "react"
 
+const DEFAULT_CATEGORIES = ["勉強", "家事", "開発"] as const
+const CATEGORIES_STORAGE_KEY = "categories"
+
 type Todo = {
   id: string
   title: string
+  category: string
   completed: boolean
   mood?: number
   /** 期限 · 日にち（1〜31） */
@@ -12,6 +16,22 @@ type Todo = {
   /** 完了した日時（ISO 8601） */
   completedAt?: string
 }
+
+function parseStoredCategories(raw: string | null): string[] {
+  if (!raw) return [...DEFAULT_CATEGORIES]
+  try {
+    const data = JSON.parse(raw) as unknown
+    if (!Array.isArray(data)) return [...DEFAULT_CATEGORIES]
+    const names = data
+      .filter((c): c is string => typeof c === "string")
+      .map((c) => c.trim())
+      .filter((c) => c !== "")
+    return names.length > 0 ? names : [...DEFAULT_CATEGORIES]
+  } catch {
+    return [...DEFAULT_CATEGORIES]
+  }
+}
+// 日付と時刻を受け取って文字列を作る関数
 
 function formatDueLabel(d?: number, h?: number): string | null {
   if (
@@ -29,19 +49,31 @@ function formatDueLabel(d?: number, h?: number): string | null {
   return `${d}日 ${h}時`
 }
 
+// iso形式の日時データを日と時間に変換する関数
+
 function legacyDueAtToDayHour(iso: string): { dueDay: number; dueHour: number } | null {
-  const d = new Date(iso)
+  const d = new Date(iso) // 日時オブジェクト
   if (Number.isNaN(d.getTime())) return null
   return { dueDay: d.getDate(), dueHour: d.getHours() }
 }
 
-function parseStoredTodos(raw: string | null): Todo[] {
+function parseStoredTodos(
+  raw: string | null,
+  categories: string[]
+): Todo[] {
   if (!raw) return []
+  const fallbackCategory = categories[0] ?? DEFAULT_CATEGORIES[0]
   try {
     const data = JSON.parse(raw) as unknown
     if (!Array.isArray(data)) return []
     return data.map((item): Todo => {
       const o = item as Partial<Todo> & { id?: string; dueAt?: string }
+      const category =
+        typeof o.category === "string" &&
+        o.category.trim() !== "" &&
+        categories.includes(o.category.trim())
+          ? o.category.trim()
+          : fallbackCategory
       const mood =
         typeof o.mood === "number" &&
         Number.isInteger(o.mood) &&
@@ -92,6 +124,7 @@ function parseStoredTodos(raw: string | null): Todo[] {
       return {
         id: o.id && typeof o.id === "string" ? o.id : crypto.randomUUID(),
         title: typeof o.title === "string" ? o.title : "",
+        category,
         completed: Boolean(o.completed),
         ...(mood !== undefined ? { mood } : {}),
         ...(dueOk ? { dueDay, dueHour } : {}),
@@ -104,21 +137,60 @@ function parseStoredTodos(raw: string | null): Todo[] {
 }
 
 function App() {
-  const [todos, setTodos] = useState<Todo[]>(() =>
-    parseStoredTodos(localStorage.getItem("todos"))
+  const [categories, setCategories] = useState<string[]>(() =>
+    parseStoredCategories(localStorage.getItem(CATEGORIES_STORAGE_KEY))
   )
+  const [todos, setTodos] = useState<Todo[]>(() => {
+    const cats = parseStoredCategories(
+      localStorage.getItem(CATEGORIES_STORAGE_KEY)
+    )
+    return parseStoredTodos(localStorage.getItem("todos"), cats)
+  })
   const [text, setText] = useState("")
+  const [categoryDraft, setCategoryDraft] = useState(
+    () =>
+      parseStoredCategories(localStorage.getItem(CATEGORIES_STORAGE_KEY))[0] ??
+      DEFAULT_CATEGORIES[0]
+  )
+  const [newCategoryName, setNewCategoryName] = useState("")
   const [dueDayDraft, setDueDayDraft] = useState("")
   const [dueHourDraft, setDueHourDraft] = useState("")
   const [showCompleted, setShowCompleted] = useState(true)
+  const [showCategorySettings, setShowCategorySettings] = useState(false)
   const [moodTargetId, setMoodTargetId] = useState<string | null>(null)
 
   useEffect(() => {
     localStorage.setItem("todos", JSON.stringify(todos))
   }, [todos])
 
+  useEffect(() => {
+    localStorage.setItem(CATEGORIES_STORAGE_KEY, JSON.stringify(categories))
+  }, [categories])
+
+  const addCategory = () => {
+    const name = newCategoryName.trim()
+    if (name === "") return
+    if (categories.includes(name)) {
+      alert("同じ名前のカテゴリが既にあります")
+      return
+    }
+    setCategories((prev) => [...prev, name])
+    setNewCategoryName("")
+  }
+
+  const removeCategory = (name: string) => {
+    if (categories.length <= 1) return
+    const fallback = categories.find((c) => c !== name) ?? categories[0]
+    setCategories((prev) => prev.filter((c) => c !== name))
+    setTodos((prev) =>
+      prev.map((t) => (t.category === name ? { ...t, category: fallback } : t))
+    )
+    if (categoryDraft === name) setCategoryDraft(fallback)
+  }
+
   const addTodo = () => {
     if (text.trim() === "") return
+    if (!categoryDraft || !categories.includes(categoryDraft)) return
     const d = dueDayDraft === "" ? NaN : Number(dueDayDraft)
     const h = dueHourDraft === "" ? NaN : Number(dueHourDraft)
     const dueOk =
@@ -133,6 +205,7 @@ function App() {
     const newTodo: Todo = {
       id: crypto.randomUUID(),
       title: text.trim(),
+      category: categoryDraft,
       completed: false,
       ...(dueOk ? { dueDay: d, dueHour: h } : {}),
     }
@@ -259,6 +332,7 @@ function App() {
           >
             {todo.title}
           </p>
+          <p className="mt-1 text-xs text-violet-300/90">{todo.category}</p>
           {todo.completed ? (
             <>
               {dueLabel && (
@@ -318,20 +392,32 @@ function App() {
           )}
         </div>
         <div className="flex shrink-0 gap-2">
-          <button
-            type="button"
-            onClick={() => toggleTodo(todo.id)}
-            className="rounded-lg bg-violet-600 px-3 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-violet-500"
-          >
-            {todo.completed ? "未完了に戻す" : "完了"}
-          </button>
-          <button
-            type="button"
-            onClick={() => deleteTodo(todo.id)}
-            className="rounded-lg border border-slate-500/80 bg-slate-800 px-3 py-2 text-sm text-slate-200 transition hover:border-rose-400/60 hover:text-rose-200"
-          >
-            削除
-          </button>
+          {todo.completed ? (
+            <button
+              type="button"
+              onClick={() => toggleTodo(todo.id)}
+              className="rounded-lg bg-violet-600 px-3 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-violet-500"
+            >
+              未完了に戻す
+            </button>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={() => toggleTodo(todo.id)}
+                className="rounded-lg bg-violet-600 px-3 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-violet-500"
+              >
+                完了
+              </button>
+              <button
+                type="button"
+                onClick={() => deleteTodo(todo.id)}
+                className="rounded-lg border border-slate-500/80 bg-slate-800 px-3 py-2 text-sm text-slate-200 transition hover:border-rose-400/60 hover:text-rose-200"
+              >
+                削除
+              </button>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -344,9 +430,72 @@ function App() {
         <h1 className="mb-2 text-center text-3xl font-bold tracking-tight sm:text-4xl">
           感情ログTodo
         </h1>
-        <p className="mb-8 text-center text-sm text-slate-400">
+        <p className="mb-6 text-center text-sm text-slate-400">
           完了時に気分を1〜5で記録します
         </p>
+
+        <section className="mb-8 rounded-2xl border border-slate-700/80 bg-slate-950/40 p-4">
+          <button
+            type="button"
+            onClick={() => setShowCategorySettings((v) => !v)}
+            className="flex w-full items-center justify-between text-left text-sm font-medium text-slate-200"
+          >
+            カテゴリ設定
+            <span className="text-slate-500">
+              {showCategorySettings ? "▲" : "▼"}
+            </span>
+          </button>
+          {showCategorySettings && (
+            <div className="mt-4 space-y-4">
+              <ul className="space-y-2">
+                {categories.map((name) => (
+                  <li
+                    key={name}
+                    className="flex items-center justify-between gap-2 rounded-lg border border-slate-700/60 bg-slate-900/60 px-3 py-2"
+                  >
+                    <span className="text-sm text-slate-200">{name}</span>
+                    <button
+                      type="button"
+                      onClick={() => removeCategory(name)}
+                      disabled={categories.length <= 1}
+                      title={
+                        categories.length <= 1
+                          ? "カテゴリは1つ以上必要です"
+                          : "削除"
+                      }
+                      className="rounded-md border border-slate-600 px-2 py-1 text-xs text-slate-300 transition enabled:hover:border-rose-400/60 enabled:hover:text-rose-200 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      削除
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {categories.length <= 1 && (
+                <p className="text-xs text-amber-400/90">
+                  カテゴリが1つだけのときは削除できません
+                </p>
+              )}
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={newCategoryName}
+                  onChange={(e) => setNewCategoryName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && addCategory()}
+                  placeholder="新しいカテゴリ名（1つずつ追加）"
+                  className="min-w-0 flex-1 rounded-lg border border-slate-600 bg-slate-950/50 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-violet-500 focus:ring-1 focus:ring-violet-500/50"
+                />
+                <button
+                  type="button"
+                  onClick={addCategory}
+                  disabled={newCategoryName.trim() === ""}
+                  className="shrink-0 rounded-lg bg-slate-700 px-3 py-2 text-sm font-medium text-white transition enabled:hover:bg-slate-600 disabled:opacity-40"
+                >
+                  追加
+                </button>
+              </div>
+            </div>
+          )}
+        </section>
 
         <div className="mb-8 space-y-3">
           <div className="flex gap-2">
@@ -361,10 +510,31 @@ function App() {
             <button
               type="button"
               onClick={addTodo}
-              className="shrink-0 rounded-xl bg-violet-600 px-5 py-3 font-semibold text-white shadow-lg shadow-violet-900/40 transition hover:bg-violet-500 active:scale-[0.98]"
+              disabled={!categoryDraft || text.trim() === ""}
+              className="shrink-0 rounded-xl bg-violet-600 px-5 py-3 font-semibold text-white shadow-lg shadow-violet-900/40 transition enabled:hover:bg-violet-500 enabled:active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40"
             >
               追加
             </button>
+          </div>
+          <div>
+            <label
+              htmlFor="new-category"
+              className="mb-1 block text-xs text-slate-500"
+            >
+              カテゴリ（必須）
+            </label>
+            <select
+              id="new-category"
+              value={categoryDraft}
+              onChange={(e) => setCategoryDraft(e.target.value)}
+              className="w-full rounded-xl border border-slate-600 bg-slate-950/50 px-4 py-2.5 text-sm text-slate-100 outline-none focus:border-violet-500 focus:ring-2 focus:ring-violet-500/40"
+            >
+              {categories.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
           </div>
           <div>
             <p className="mb-1 text-xs text-slate-500">
