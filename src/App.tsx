@@ -4,7 +4,7 @@ const DEFAULT_CATEGORIES = ["勉強", "家事", "開発"] as const
 const CATEGORIES_STORAGE_KEY = "categories"
 
 type Priority = "high" | "medium" | "low"
-type View = "main" | "calendar" | "settings"
+type View = "main" | "calendar" | "settings" | "dashboard"
 
 type Todo = {
   id: string
@@ -212,8 +212,14 @@ function App() {
     const now = new Date()
     return new Date(now.getFullYear(), now.getMonth(), 1)
   })
+  const [selectedCalendarDay, setSelectedCalendarDay] = useState<number | null>(null)
   const [moodTargetId, setMoodTargetId] = useState<string | null>(null)
+  const [moodDraft, setMoodDraft] = useState<1 | 2 | 3 | 4 | 5 | null>(null)
   const [moodNoteDraft, setMoodNoteDraft] = useState("")
+  const [aiAnalysis, setAiAnalysis] = useState("")
+  const [aiLoading, setAiLoading] = useState(false)
+  const [aiError, setAiError] = useState<string | null>(null)
+  const geminiApiKey = import.meta.env.VITE_GEMINI_API_KEY
 
   useEffect(() => {
     localStorage.setItem("todos", JSON.stringify(todos))
@@ -312,12 +318,17 @@ function App() {
       )
       return
     }
-    setMoodNoteDraft("")
+    const nextMood =
+      todo.mood === 1 || todo.mood === 2 || todo.mood === 3 || todo.mood === 4 || todo.mood === 5
+        ? todo.mood
+        : null
+    setMoodDraft(nextMood)
+    setMoodNoteDraft(todo.moodNote ?? "")
     setMoodTargetId(id)
   }
 
-  const completeWithMood = (mood: 1 | 2 | 3 | 4 | 5) => {
-    if (!moodTargetId) return
+  const completeWithMood = () => {
+    if (!moodTargetId || moodDraft === null) return
     const note = moodNoteDraft.trim()
     setTodos((prev) =>
       prev.map((todo) =>
@@ -325,7 +336,7 @@ function App() {
           ? {
               ...todo,
               completed: true,
-              mood,
+              mood: moodDraft,
               ...(note !== "" ? { moodNote: note } : { moodNote: undefined }),
               completedAt: new Date().toISOString(),
             }
@@ -333,12 +344,38 @@ function App() {
       )
     )
     setMoodTargetId(null)
+    setMoodDraft(null)
     setMoodNoteDraft("")
   }
 
   const cancelMoodPicker = () => {
     setMoodTargetId(null)
+    setMoodDraft(null)
     setMoodNoteDraft("")
+  }
+
+  const isTodoOverdue = (todo: Todo) => {
+    if (todo.completed || !todo.dueDate || todo.dueHour === undefined) return false
+    const now = new Date()
+    const due = new Date(`${todo.dueDate}T${String(todo.dueHour).padStart(2, "0")}:00:00`)
+    return due.getTime() < now.getTime()
+  }
+
+  const compareTodos = (a: Todo, b: Todo) => {
+    const overdueA = isTodoOverdue(a)
+    const overdueB = isTodoOverdue(b)
+    if (overdueA !== overdueB) return overdueA ? -1 : 1
+    const priorityWeight: Record<Priority, number> = { high: 0, medium: 1, low: 2 }
+    if (priorityWeight[a.priority] !== priorityWeight[b.priority]) {
+      return priorityWeight[a.priority] - priorityWeight[b.priority]
+    }
+    if (a.dueDate && b.dueDate) {
+      if (a.dueDate !== b.dueDate) return a.dueDate < b.dueDate ? -1 : 1
+      if (a.dueHour !== undefined && b.dueHour !== undefined) {
+        return a.dueHour - b.dueHour
+      }
+    }
+    return a.title.localeCompare(b.title)
   }
 
   const deleteTodo = (id: string) => {
@@ -382,8 +419,167 @@ function App() {
     }
   }
 
-  const activeTodos = todos.filter((t) => !t.completed)
+  const activeTodos = [...todos.filter((t) => !t.completed)].sort(compareTodos)
   const completedTodos = todos.filter((t) => t.completed)
+  const selectedDayTodos =
+    selectedCalendarDay !== null
+      ? todos.filter((t) => {
+          if (!t.dueDate || !isValidDateInput(t.dueDate)) return false
+          const d = new Date(`${t.dueDate}T12:00:00`)
+          return (
+            d.getFullYear() === calendarMonth.getFullYear() &&
+            d.getMonth() === calendarMonth.getMonth() &&
+            d.getDate() === selectedCalendarDay
+          )
+        })
+      : []
+
+  const completedMoodTodos = completedTodos.filter((t) => typeof t.mood === "number")
+  const averageMood =
+    completedMoodTodos.length > 0
+      ?
+        completedMoodTodos.reduce((sum, t) => sum + (t.mood ?? 0), 0) /
+        completedMoodTodos.length
+      : null
+
+  const categoryMoodStats = categories.map((category) => {
+    const categoryItems = completedMoodTodos.filter((t) => t.category === category)
+    return {
+      category,
+      count: categoryItems.length,
+      average:
+        categoryItems.length > 0
+          ?
+            categoryItems.reduce((sum, t) => sum + (t.mood ?? 0), 0) /
+            categoryItems.length
+          : null,
+    }
+  })
+
+  const timeOfDay = (hour: number | undefined) => {
+    if (hour === undefined) return "不明"
+    if (hour >= 6 && hour < 12) return "朝"
+    if (hour >= 12 && hour < 18) return "午後"
+    if (hour >= 18 && hour < 24) return "夜"
+    return "深夜"
+  }
+
+  const buildAiAnalysisPrompt = () => {
+    if (completedMoodTodos.length === 0) return ""
+    const lines = completedMoodTodos.map((todo, index) => {
+      const hour =
+        todo.dueHour ??
+        (todo.completedAt ? new Date(todo.completedAt).getHours() : undefined)
+      const period = timeOfDay(hour)
+      return `データ${index + 1}: カテゴリ=${todo.category}、時間帯=${period}、気分=${todo.mood}、メモ=${
+        todo.moodNote ?? "なし"
+      }`
+    })
+    return `以下は完了したタスクの記録です。
+各タスクについてカテゴリ、時間帯、気分（1〜5）、メモを示しています。
+このデータをもとに、全体の気分傾向、カテゴリ別の感情の変化、時間帯ごとの上がりやすい／下がりやすい傾向、改善のヒントを日本語で分かりやすく分析してください。
+
+${lines.join("\n")}
+
+回答は箇条書きと短いまとめを含めてください。`
+  }
+
+  const runGeminiAnalysis = async () => {
+    setAiError(null)
+    setAiLoading(true)
+    try {
+      const prompt = buildAiAnalysisPrompt()
+      if (!prompt) {
+        throw new Error("完了した気分記録がありません。")
+      }
+      if (!geminiApiKey) {
+        throw new Error("Gemini API キーが設定されていません。")
+      }
+      const response = await fetch(
+        "https://gemini.googleapis.com/v1/models/text-bison-001:generate",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${geminiApiKey}`,
+          },
+          body: JSON.stringify({
+            prompt: { text: prompt },
+            temperature: 0.2,
+            max_output_tokens: 512,
+          }),
+        }
+      )
+      const data = await response.json()
+      if (!response.ok) {
+        throw new Error(data.error?.message || "Gemini API へのリクエストに失敗しました。")
+      }
+      const resultText =
+        data.candidates?.[0]?.content ||
+        data.output?.[0]?.content ||
+        data.choices?.[0]?.message?.content ||
+        "分析結果を取得できませんでした。"
+      setAiAnalysis(resultText)
+    } catch (error) {
+      setAiAnalysis("")
+      setAiError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setAiLoading(false)
+    }
+  }
+
+  const moodPeriods = completedMoodTodos.reduce(
+    (acc, todo) => {
+      const hour =
+        todo.dueHour ??
+        (todo.completedAt ? new Date(todo.completedAt).getHours() : undefined)
+      const period = timeOfDay(hour)
+      if (!acc[period]) {
+        acc[period] = { sum: 0, count: 0 }
+      }
+      acc[period].sum += todo.mood ?? 0
+      acc[period].count += 1
+      return acc
+    },
+    {} as Record<"朝" | "午後" | "夜" | "深夜" | "不明", { sum: number; count: number }>
+  )
+
+  const periodAverages = Object.entries(moodPeriods).map(([period, stats]) => ({
+    period,
+    average: stats.count > 0 ? stats.sum / stats.count : null,
+    count: stats.count,
+  }))
+
+  const positivePeriods = periodAverages
+    .filter((item) => item.average !== null)
+    .sort((a, b) => (b.average ?? 0) - (a.average ?? 0))
+
+  const negativePeriods = periodAverages
+    .filter((item) => item.average !== null)
+    .sort((a, b) => (a.average ?? 0) - (b.average ?? 0))
+
+  const analysisSummary = (() => {
+    if (completedTodos.length === 0) {
+      return "完了したタスクがありません。完了タスクを登録すると、自動で分析します。"
+    }
+    const parts = []
+    if (averageMood !== null) {
+      parts.push(`完了タスクの平均気分は${averageMood.toFixed(1)}です。`)
+    }
+    const best = positivePeriods[0]
+    const worst = negativePeriods[0]
+    if (best && worst && best.period !== worst.period) {
+      parts.push(
+        `${best.period}は比較的気分が上がりやすく、${worst.period}は気分が下がりやすい傾向があります。`
+      )
+    }
+    const memoCount = completedMoodTodos.filter((t) => t.moodNote).length
+    if (memoCount > 0) {
+      parts.push(
+        `最近は ${memoCount} 件のメモから感情の傾向を分析しました。`)
+    }
+    return parts.join(" ")
+  })()
 
   const moodTargetTitle =
     todos.find((t) => t.id === moodTargetId)?.title ?? ""
@@ -413,6 +609,7 @@ function App() {
     setCalendarMonth(
       (prev) => new Date(prev.getFullYear(), prev.getMonth() + delta, 1)
     )
+    setSelectedCalendarDay(null)
   }
 
   const duePreview = (dateStr: string, hourStr: string) => {
@@ -495,24 +692,34 @@ function App() {
   const renderTodoCard = (todo: Todo) => {
     const dueLabel = formatDueLabel(todo.dueDate, todo.dueHour)
     const hasDue = todo.dueDate !== undefined && todo.dueHour !== undefined
+    const overdue = isTodoOverdue(todo)
     return (
     <div
       key={todo.id}
       className={`rounded-xl border p-4 shadow-sm transition ${
         todo.completed
           ? "border-slate-600/60 bg-slate-800/40"
-          : "border-violet-500/25 bg-slate-800/70 hover:border-violet-400/40"
+          : overdue
+            ? "border-rose-500/60 bg-rose-950/20"
+            : "border-violet-500/25 bg-slate-800/70 hover:border-violet-400/40"
       }`}
     >
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="min-w-0">
-          <p
-            className={`text-lg font-semibold ${
-              todo.completed ? "text-slate-500 line-through" : "text-slate-100"
-            }`}
-          >
-            {todo.title}
-          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <p
+              className={`text-lg font-semibold ${
+                todo.completed ? "text-slate-500 line-through" : "text-slate-100"
+              }`}
+            >
+              {todo.title}
+            </p>
+            {overdue && !todo.completed && (
+              <span className="rounded-full bg-rose-500/20 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-[0.12em] text-rose-200">
+                期限超過
+              </span>
+            )}
+          </div>
           <div className="mt-1 flex flex-wrap items-center gap-2">
             <span className="text-xs text-violet-300/90">{todo.category}</span>
             <span
@@ -657,13 +864,15 @@ function App() {
             calendarMonthIndex === new Date().getMonth() &&
             calendarYear === new Date().getFullYear()
           return (
-            <div
+            <button
+              type="button"
               key={day}
-              className={`min-h-[5.5rem] rounded-lg border p-1.5 text-left ${
+              onClick={() => dayTodos.length > 0 && setSelectedCalendarDay(day)}
+              className={`min-h-[5.5rem] rounded-lg border p-1.5 text-left transition ${
                 isToday
                   ? "border-violet-500/50 bg-violet-950/30"
                   : "border-slate-700/50 bg-slate-950/40"
-              }`}
+              } ${dayTodos.length > 0 ? "hover:border-violet-500/60 hover:bg-slate-900/60" : "cursor-default"}`}
             >
               <span
                 className={`inline-block text-xs font-semibold ${
@@ -697,10 +906,38 @@ function App() {
                   </li>
                 )}
               </ul>
-            </div>
+            </button>
           )
         })}
       </div>
+      {selectedCalendarDay !== null && (
+        <div className="mt-6 rounded-3xl border border-slate-700/70 bg-slate-950/70 p-5 shadow-inner shadow-slate-950/20">
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-sm font-semibold text-slate-200">
+                {calendarYear}年{calendarMonthIndex + 1}月{selectedCalendarDay}日のTodo
+              </p>
+              <p className="text-xs text-slate-500">
+                タスクを確認・操作できます。
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setSelectedCalendarDay(null)}
+              className="rounded-lg border border-slate-600 bg-slate-800/80 px-3 py-2 text-xs text-slate-300 transition hover:border-violet-500/50 hover:text-white"
+            >
+              閉じる
+            </button>
+          </div>
+          {selectedDayTodos.length === 0 ? (
+            <p className="text-sm text-slate-500">この日は期限付きの Todo がありません。</p>
+          ) : (
+            <div className="space-y-4">
+              {selectedDayTodos.map(renderTodoCard)}
+            </div>
+          )}
+        </div>
+      )}
     </>
   )
 
@@ -759,6 +996,116 @@ function App() {
           追加
         </button>
       </div>
+    </>
+  )
+
+  const dashboardView = (
+    <>
+      <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h2 className="text-2xl font-bold tracking-tight text-white">ダッシュボード</h2>
+          <p className="mt-1 text-sm text-slate-400">
+            完了したタスクの平均気分とカテゴリ別の傾向を確認できます。
+          </p>
+        </div>
+        <div className="rounded-3xl border border-slate-700/60 bg-slate-900/70 p-4 text-sm text-slate-200">
+          <p>完了タスク: {completedTodos.length} 件</p>
+          <p>気分記録済み: {completedMoodTodos.length} 件</p>
+        </div>
+      </div>
+
+      <section className="mb-6 rounded-3xl border border-slate-700/60 bg-slate-950/60 p-5">
+        <h3 className="mb-3 text-lg font-semibold text-white">平均気分</h3>
+        <p className="text-4xl font-bold text-violet-200">
+          {averageMood !== null ? averageMood.toFixed(1) : "記録なし"}
+        </p>
+        <p className="mt-2 text-sm text-slate-400">
+          完了したタスクに対する平均気分です。
+        </p>
+      </section>
+
+      <section className="mb-6 grid gap-4 sm:grid-cols-2">
+        {categoryMoodStats.map((item) => (
+          <div
+            key={item.category}
+            className="rounded-3xl border border-slate-700/60 bg-slate-950/60 p-5"
+          >
+            <h4 className="text-sm font-semibold text-slate-200">{item.category}</h4>
+            <p className="mt-2 text-3xl font-bold text-slate-100">
+              {item.average !== null ? item.average.toFixed(1) : "-"}
+            </p>
+            <p className="mt-1 text-xs text-slate-500">完了タスク: {item.count} 件</p>
+          </div>
+        ))}
+      </section>
+
+      <section className="rounded-3xl border border-slate-700/60 bg-slate-950/60 p-5">
+        <h3 className="mb-3 text-lg font-semibold text-white">気分分析</h3>
+        <p className="text-sm leading-relaxed text-slate-300">
+          {analysisSummary}
+        </p>
+        <div className="mt-6 grid gap-4 sm:grid-cols-2">
+          <div className="rounded-3xl border border-slate-700/60 bg-slate-900/70 p-4">
+            <p className="text-xs text-slate-500">気分が上がりやすい時間帯</p>
+            <p className="mt-2 text-lg font-semibold text-slate-100">
+              {positivePeriods.length > 0 && positivePeriods[0].average !== null
+                ? `${positivePeriods[0].period} (${positivePeriods[0].average.toFixed(1)})`
+                : "記録なし"}
+            </p>
+          </div>
+          <div className="rounded-3xl border border-slate-700/60 bg-slate-900/70 p-4">
+            <p className="text-xs text-slate-500">気分が下がりやすい時間帯</p>
+            <p className="mt-2 text-lg font-semibold text-slate-100">
+              {negativePeriods.length > 0 && negativePeriods[0].average !== null
+                ? `${negativePeriods[0].period} (${negativePeriods[0].average.toFixed(1)})`
+                : "記録なし"}
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-6 rounded-3xl border border-slate-700/60 bg-slate-900/70 p-5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h4 className="text-sm font-semibold text-white">AIによるコメント</h4>
+              <p className="mt-1 text-xs text-slate-500">
+                完了済みタスクのカテゴリ・時間帯・気分・メモ情報を Gemini で分析します。
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={runGeminiAnalysis}
+              disabled={aiLoading || completedMoodTodos.length === 0 || !geminiApiKey}
+              className="rounded-xl bg-violet-600 px-4 py-2 text-sm font-semibold text-white transition enabled:hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {aiLoading ? "分析中..." : "Geminiで分析する"}
+            </button>
+          </div>
+          {aiError && (
+            <p className="mt-4 rounded-2xl border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-200">
+              エラー: {aiError}
+            </p>
+          )}
+          {aiAnalysis && !aiError && (
+            <div className="mt-4 rounded-3xl bg-slate-950/80 p-4 text-sm leading-relaxed text-slate-200">
+              {aiAnalysis.split("\n").map((line, index) => (
+                <p key={index} className="mt-2 first:mt-0">
+                  {line}
+                </p>
+              ))}
+            </div>
+          )}
+          {!geminiApiKey && (
+            <p className="mt-4 text-xs text-slate-500">
+              Gemini API キーを `VITE_GEMINI_API_KEY` で設定してください。
+            </p>
+          )}
+          {completedMoodTodos.length === 0 && (
+            <p className="mt-4 text-xs text-slate-500">
+              気分付きの完了タスクが必要です。タスク完了時に気分を記録してください。
+            </p>
+          )}
+        </div>
+      </section>
     </>
   )
 
@@ -922,6 +1269,17 @@ function App() {
             </button>
             <button
               type="button"
+              onClick={() => setView("dashboard")}
+              className={`rounded-lg border px-3 py-2 text-sm transition ${
+                view === "dashboard"
+                  ? "border-violet-500 bg-violet-600/20 text-white"
+                  : "border-slate-600 bg-slate-800/80 text-slate-300 hover:border-violet-500/50"
+              }`}
+            >
+              ダッシュボード
+            </button>
+            <button
+              type="button"
               onClick={() => setView("settings")}
               className={`rounded-lg border px-3 py-2 text-sm transition ${
                 view === "settings"
@@ -936,9 +1294,11 @@ function App() {
 
         {view === "calendar"
           ? calendarView
-          : view === "settings"
-            ? settingsView
-            : mainView}
+          : view === "dashboard"
+            ? dashboardView
+            : view === "settings"
+              ? settingsView
+              : mainView}
       </div>
 
       {moodTargetId && (
@@ -961,13 +1321,20 @@ function App() {
             <p className="mt-1 text-center text-xs text-slate-500">
               1（つらい）〜 5（最高）
             </p>
-            <div className="mt-6 grid grid-cols-5 gap-2">
+            <p className="mt-4 text-center text-xs text-slate-400">
+              絵文字を押して選択し、下の完了ボタンで記録します
+            </p>
+            <div className="mt-4 grid grid-cols-5 gap-2">
               {([1, 2, 3, 4, 5] as const).map((n) => (
                 <button
                   key={n}
                   type="button"
-                  onClick={() => completeWithMood(n)}
-                  className="flex flex-col items-center gap-1 rounded-xl border border-slate-600 bg-slate-800 py-3 text-sm font-medium text-slate-200 transition hover:border-violet-500 hover:bg-violet-600/20 hover:text-white"
+                  onClick={() => setMoodDraft(n)}
+                  className={`flex flex-col items-center gap-1 rounded-xl border px-3 py-3 text-sm font-medium transition ${
+                    moodDraft === n
+                      ? "border-violet-400 bg-violet-600/20 text-white"
+                      : "border-slate-600 bg-slate-800 text-slate-200 hover:border-violet-500 hover:bg-violet-600/20"
+                  }`}
                 >
                   <span className="text-xl">{moodEmoji(n)}</span>
                   <span>{n}</span>
@@ -987,8 +1354,16 @@ function App() {
             />
             <button
               type="button"
+              onClick={completeWithMood}
+              disabled={moodDraft === null}
+              className="mt-4 w-full rounded-xl bg-violet-600 px-4 py-2.5 text-sm font-semibold text-white transition enabled:hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              完了として記録する
+            </button>
+            <button
+              type="button"
               onClick={cancelMoodPicker}
-              className="mt-4 w-full rounded-xl border border-slate-600 py-2.5 text-sm text-slate-300 transition hover:bg-slate-800"
+              className="mt-3 w-full rounded-xl border border-slate-600 py-2.5 text-sm text-slate-300 transition hover:bg-slate-800"
             >
               キャンセル
             </button>
